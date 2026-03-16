@@ -261,9 +261,8 @@ async def health():
 # START
 # =========================================
 
-@app.on_event("startup")
+@api.on_event("startup")
 async def startup():
-
     webhook_url = f"{PUBLIC_BASE_URL}/telegram"
     await bot.set_webhook(webhook_url)
 
