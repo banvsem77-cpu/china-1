@@ -1,12 +1,15 @@
 import os
-import urllib.parse
+import json
 import tempfile
+import urllib.parse
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 
 from telegram import Update
 from telegram.ext import (
+    Application,
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
@@ -16,247 +19,547 @@ from telegram.ext import (
 
 from huggingface_hub import InferenceClient
 
-# =================================
-# ENV
-# =================================
 
+# =========================================================
+# ENV
+# =========================================================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 HF_TOKEN = os.getenv("HF_TOKEN")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL")
 
-# =================================
-# AI
-# =================================
+if not TELEGRAM_BOT_TOKEN:
+    raise RuntimeError("Не задан TELEGRAM_BOT_TOKEN")
 
-client = InferenceClient(
-    model="HuggingFaceH4/zephyr-7b-beta",
-    token=HF_TOKEN
+if not HF_TOKEN:
+    raise RuntimeError("Не задан HF_TOKEN")
+
+if not PUBLIC_BASE_URL:
+    raise RuntimeError("Не задан PUBLIC_BASE_URL")
+
+
+# =========================================================
+# AI CLIENTS
+# =========================================================
+text_client = InferenceClient(
+    provider="hf-inference",
+    model="katanemo/Arch-Router-1.5B",
+    token=HF_TOKEN,
 )
 
-# =================================
-# TELEGRAM
-# =================================
+vision_client = InferenceClient(token=HF_TOKEN)
 
-telegram_app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
-# =================================
-# FASTAPI
-# =================================
+# =========================================================
+# CALC SETTINGS
+# =========================================================
+CHINA_LOCAL_DELIVERY_PER_KG = 0.35
+INTERNATIONAL_DELIVERY_PER_KG = 4.50
+SERVICE_FEE_PERCENT = 10
 
-api = FastAPI()
 
-# =================================
-# КАЛЬКУЛЯТОР
-# =================================
+# =========================================================
+# HELPERS
+# =========================================================
+def contains_chinese(text: str) -> bool:
+    for ch in text:
+        if "\u4e00" <= ch <= "\u9fff":
+            return True
+    return False
 
-CHINA_DELIVERY = 0.35
-INTL_DELIVERY = 4.5
-SERVICE_FEE = 0.10
 
-# =================================
-# КИТАЙСКИЙ ЗАПРОС
-# =================================
+def encode_cn_query(text: str) -> str:
+    return urllib.parse.quote(text.encode("gb18030"))
 
-def translate_to_chinese(text):
 
-    prompt = f"""
-Переведи товар на китайский для поиска на 1688.
+def encode_utf8_query(text: str) -> str:
+    return urllib.parse.quote(text)
 
-Товар:
-{text}
 
-Ответ только китайским словом.
-"""
+def fallback_keywords(product_text: str) -> dict:
+    text = product_text.lower().strip()
+
+    presets = {
+        "силиконовая форма для льда": {
+            "short": "硅胶冰块模具",
+            "queries": [
+                "硅胶冰块模具",
+                "食品级硅胶制冰模具",
+                "硅胶冰格模具",
+                "创意冰块模具",
+                "家用制冰模具",
+            ],
+            "main": "硅胶冰块模具",
+        },
+        "форма для льда": {
+            "short": "冰块模具",
+            "queries": [
+                "冰块模具",
+                "制冰模具",
+                "硅胶冰格",
+                "家用冰块模具",
+                "创意冰块模具",
+            ],
+            "main": "冰块模具",
+        },
+        "термос": {
+            "short": "保温杯",
+            "queries": [
+                "保温杯",
+                "不锈钢保温杯",
+                "便携保温水杯",
+                "双层保温杯",
+                "定制保温杯",
+            ],
+            "main": "保温杯",
+        },
+        "рюкзак": {
+            "short": "背包",
+            "queries": [
+                "背包",
+                "双肩包",
+                "旅行背包",
+                "学生书包",
+                "定制背包",
+            ],
+            "main": "背包",
+        },
+        "сумка": {
+            "short": "包",
+            "queries": [
+                "包",
+                "手提包",
+                "单肩包",
+                "女包",
+                "定制包",
+            ],
+            "main": "包",
+        },
+        "бутылка для воды": {
+            "short": "水杯",
+            "queries": [
+                "水杯",
+                "运动水杯",
+                "便携水壶",
+                "塑料水杯",
+                "不锈钢水壶",
+            ],
+            "main": "水杯",
+        },
+    }
+
+    for key, value in presets.items():
+        if key in text:
+            return value
+
+    return {
+        "short": product_text,
+        "queries": [],
+        "main": "",
+    }
+
+
+def ask_ai_for_keywords(product_text: str) -> dict:
+    prompt = (
+        "Верни только JSON без пояснений.\n"
+        "Нужно подготовить китайские запросы для поиска товара на китайских площадках.\n\n"
+        f"Товар: {product_text}\n\n"
+        "Строгий формат ответа:\n"
+        "{\n"
+        '  "short": "китайское короткое название",\n'
+        '  "queries": ["китайский запрос 1", "китайский запрос 2", "китайский запрос 3", "китайский запрос 4", "китайский запрос 5"],\n'
+        '  "main": "лучший китайский запрос"\n'
+        "}\n\n"
+        "Правила:\n"
+        "- short должен быть на китайском\n"
+        "- queries только на китайском\n"
+        "- main только на китайском\n"
+        "- не используй русский\n"
+        "- не используй английский\n"
+        "- без markdown\n"
+        "- без текста до JSON и после JSON"
+    )
 
     try:
-        resp = client.chat.completions.create(
+        output = text_client.chat_completion(
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=50
+            max_tokens=220,
+            temperature=0.2,
         )
 
-        return resp.choices[0].message.content.strip()
+        raw_text = output.choices[0].message.content.strip()
 
-    except:
-        return text
+        start = raw_text.find("{")
+        end = raw_text.rfind("}")
 
-# =================================
-# ССЫЛКИ ПОСТАВЩИКОВ
-# =================================
+        if start != -1 and end != -1 and end > start:
+            json_text = raw_text[start:end + 1]
+            data = json.loads(json_text)
 
-def generate_supplier_links(query):
+            short = str(data.get("short", "")).strip()
+            queries = data.get("queries", [])
+            main = str(data.get("main", "")).strip()
 
-    q_cn = urllib.parse.quote(query.encode("gb18030"))
-    q_utf = urllib.parse.quote(query)
+            if not isinstance(queries, list):
+                queries = []
 
-    return f"""
-ТОП поставщиков
+            queries = [str(q).strip() for q in queries if str(q).strip()]
+            clean_queries = [q for q in queries if contains_chinese(q)]
 
-1688
-https://s.1688.com/selloffer/offer_search.htm?keywords={q_cn}
+            if short and contains_chinese(short) and clean_queries and contains_chinese(main):
+                return {
+                    "short": short,
+                    "queries": clean_queries[:5],
+                    "main": main,
+                }
+    except Exception:
+        pass
 
-Taobao
-https://s.taobao.com/search?q={q_cn}
+    return fallback_keywords(product_text)
 
-Alibaba
-https://www.alibaba.com/trade/search?SearchText={q_utf}
 
-Tmall
-https://list.tmall.com/search_product.htm?q={q_cn}
+def describe_image(image_path: str) -> str:
+    try:
+        result = vision_client.image_to_text(
+            image=image_path,
+            model="Salesforce/blip-image-captioning-base",
+        )
+        return str(result).strip()
+    except Exception:
+        return ""
 
-Made-in-China
-https://www.google.com/search?q=site%3Amade-in-china.com%20{q_utf}
-"""
 
-# =================================
-# START
-# =================================
+def build_search_urls(main_query: str, short_query: str, extra_queries: list[str]) -> dict:
+    """
+    Делаем стабильные прямые ссылки поиска.
+    1688: 7 ссылок
+    остальные площадки: по 2 ссылки
+    """
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # соберём список уникальных китайских запросов
+    ordered = []
+    for q in [main_query, short_query] + extra_queries:
+        q = (q or "").strip()
+        if q and contains_chinese(q) and q not in ordered:
+            ordered.append(q)
 
-    text = """
-Привет! Я бот закупщика.
+    if not ordered:
+        ordered = [main_query]
 
-Что умею:
+    # подстрахуемся количеством
+    while len(ordered) < 7:
+        ordered.append(ordered[-1])
 
-1. Поиск по названию
-2. Поиск по фото
-3. Китайский запрос
-4. Ссылки на поставщиков
-5. /calc цена вес количество
+    q1688 = ordered[:7]
+    q_other = ordered[:2]
 
-Пример:
-силиконовая форма для льда
+    result = {
+        "1688": [],
+        "Taobao": [],
+        "Alibaba": [],
+        "Tmall": [],
+        "Made-in-China": [],
+    }
 
-/calc 0.42 18 1000
-"""
+    for q in q1688:
+        cn = encode_cn_query(q)
+        result["1688"].append(f"https://s.1688.com/selloffer/offer_search.htm?keywords={cn}")
 
-    await update.message.reply_text(text)
+    for q in q_other:
+        cn = encode_cn_query(q)
+        utf = encode_utf8_query(q)
 
-# =================================
-# КАЛЬКУЛЯТОР
-# =================================
+        result["Taobao"].append(f"https://s.taobao.com/search?q={cn}")
+        result["Alibaba"].append(f"https://www.alibaba.com/trade/search?SearchText={utf}")
+        result["Tmall"].append(f"https://list.tmall.com/search_product.htm?q={cn}")
+        result["Made-in-China"].append(
+            f"https://www.google.com/search?q={encode_utf8_query('site:made-in-china.com ' + q)}"
+        )
 
-async def calc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return result
+
+
+def format_keywords_result(result: dict) -> str:
+    short = result.get("short", "").strip()
+    queries = result.get("queries", [])
+    main = result.get("main", "").strip()
+
+    queries_text = "\n".join(queries) if queries else "Китайские запросы не найдены"
+
+    return (
+        f"КРАТКО:\n{short}\n\n"
+        f"ЗАПРОСЫ:\n{queries_text}\n\n"
+        f"ОСНОВНОЙ_ЗАПРОС:\n{main}"
+    )
+
+
+def format_supplier_result(urls: dict) -> str:
+    text = "Поиск поставщиков:\n"
+    text += "• 7 результатов 1688\n"
+    text += "• 2 Taobao\n"
+    text += "• 2 Alibaba\n"
+    text += "• 2 Tmall\n"
+    text += "• 2 Made-in-China\n\n"
+
+    if urls["1688"]:
+        text += "1688\n"
+        for i, link in enumerate(urls["1688"], 1):
+            text += f"{i}️⃣ {link}\n"
+        text += "\n"
+
+    if urls["Taobao"]:
+        text += "Taobao\n"
+        for i, link in enumerate(urls["Taobao"], 1):
+            text += f"{i}️⃣ {link}\n"
+        text += "\n"
+
+    if urls["Alibaba"]:
+        text += "Alibaba\n"
+        for i, link in enumerate(urls["Alibaba"], 1):
+            text += f"{i}️⃣ {link}\n"
+        text += "\n"
+
+    if urls["Tmall"]:
+        text += "Tmall\n"
+        for i, link in enumerate(urls["Tmall"], 1):
+            text += f"{i}️⃣ {link}\n"
+        text += "\n"
+
+    if urls["Made-in-China"]:
+        text += "Made-in-China\n"
+        for i, link in enumerate(urls["Made-in-China"], 1):
+            text += f"{i}️⃣ {link}\n"
+
+    return text.strip()
+
+
+def parse_calc_text(text: str):
+    parts = text.strip().split()
+    if len(parts) != 4:
+        return None
 
     try:
+        unit_price = float(parts[1])
+        total_weight_kg = float(parts[2])
+        quantity = int(parts[3])
+        return unit_price, total_weight_kg, quantity
+    except ValueError:
+        return None
 
-        _, price, weight, qty = update.message.text.split()
 
-        price = float(price)
-        weight = float(weight)
-        qty = int(qty)
+def calculate_total(unit_price: float, total_weight_kg: float, quantity: int):
+    goods_total = unit_price * quantity
+    china_delivery = total_weight_kg * CHINA_LOCAL_DELIVERY_PER_KG
+    intl_delivery = total_weight_kg * INTERNATIONAL_DELIVERY_PER_KG
+    subtotal = goods_total + china_delivery + intl_delivery
+    service_fee = subtotal * (SERVICE_FEE_PERCENT / 100)
+    grand_total = subtotal + service_fee
+    per_unit_total = grand_total / quantity if quantity else 0
 
-        goods = price * qty
-        china = weight * CHINA_DELIVERY
-        intl = weight * INTL_DELIVERY
+    return {
+        "goods_total": round(goods_total, 2),
+        "china_delivery": round(china_delivery, 2),
+        "intl_delivery": round(intl_delivery, 2),
+        "service_fee": round(service_fee, 2),
+        "grand_total": round(grand_total, 2),
+        "per_unit_total": round(per_unit_total, 4),
+    }
 
-        subtotal = goods + china + intl
-        fee = subtotal * SERVICE_FEE
-        total = subtotal + fee
 
-        per_unit = total / qty
+# =========================================================
+# TELEGRAM HANDLERS
+# =========================================================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "Привет! Я бот закупщика.\n\n"
+        "Что умею:\n"
+        "1. Поиск по названию\n"
+        "2. Поиск по фото\n"
+        "3. Китайские запросы\n"
+        "4. Поиск поставщиков:\n"
+        "   • 7 результатов 1688\n"
+        "   • 2 Taobao\n"
+        "   • 2 Alibaba\n"
+        "   • 2 Tmall\n"
+        "   • 2 Made-in-China\n"
+        "5. /calc цена вес количество\n\n"
+        "Пример:\n"
+        "силиконовая форма для льда\n"
+        "/calc 0.42 18 1000"
+    )
+    await update.message.reply_text(text)
 
-        text = f"""
-Расчет готов:
 
-Товар: ${round(goods,2)}
-Доставка по Китаю: ${round(china,2)}
-Международная доставка: ${round(intl,2)}
-Комиссия: ${round(fee,2)}
+async def calc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    parsed = parse_calc_text(update.message.text)
 
-ИТОГО: ${round(total,2)}
-Себестоимость за 1 шт: ${round(per_unit,3)}
-"""
+    if not parsed:
+        await update.message.reply_text(
+            "Неверный формат.\nПример:\n/calc 0.42 18 1000"
+        )
+        return
+
+    unit_price, total_weight_kg, quantity = parsed
+    result = calculate_total(unit_price, total_weight_kg, quantity)
+
+    text = (
+        "Расчет готов:\n\n"
+        f"Товар: ${result['goods_total']}\n"
+        f"Доставка по Китаю: ${result['china_delivery']}\n"
+        f"Международная доставка: ${result['intl_delivery']}\n"
+        f"Комиссия: ${result['service_fee']}\n\n"
+        f"ИТОГО: ${result['grand_total']}\n"
+        f"Себестоимость за 1 шт: ${result['per_unit_total']}"
+    )
+    await update.message.reply_text(text)
+
+
+async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    product_name = update.message.text.strip()
+
+    try:
+        await update.message.reply_text("Ищу китайские запросы и поставщиков, подождите...")
+
+        keywords = ask_ai_for_keywords(product_name)
+        if not keywords.get("main") or not contains_chinese(keywords.get("main", "")):
+            keywords = fallback_keywords(product_name)
+
+        main_query = keywords.get("main", "").strip()
+        if not main_query:
+            await update.message.reply_text("Не удалось подобрать китайский запрос. Попробуйте уточнить товар.")
+            return
+
+        urls = build_search_urls(
+            main_query=main_query,
+            short_query=keywords.get("short", ""),
+            extra_queries=keywords.get("queries", []),
+        )
+
+        text = (
+            f"{format_keywords_result(keywords)}\n\n"
+            f"{format_supplier_result(urls)}"
+        )
 
         await update.message.reply_text(text)
 
-    except:
-        await update.message.reply_text("Пример: /calc 0.42 18 1000")
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка поиска: {str(e)}")
 
-# =================================
-# ПОИСК ТОВАРА
-# =================================
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    temp_path = None
 
-    text = update.message.text
+    try:
+        await update.message.reply_text("Получил фото. Анализирую...")
 
-    await update.message.reply_text("Ищу поставщиков...")
+        photo = update.message.photo[-1]
+        tg_file = await context.bot.get_file(photo.file_id)
 
-    chinese = translate_to_chinese(text)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
+            temp_path = tmp.name
 
-    links = generate_supplier_links(chinese)
+        await tg_file.download_to_drive(custom_path=temp_path)
 
-    result = f"""
-КИТАЙСКИЙ ЗАПРОС
-{chinese}
+        caption = update.message.caption.strip() if update.message.caption else ""
+        image_description = describe_image(temp_path)
 
-{links}
-"""
+        source_text = caption or image_description
+        if not source_text:
+            await update.message.reply_text(
+                "Не удалось понять товар по фото.\n"
+                "Отправьте фото ещё раз с подписью, например:\n"
+                "«силиконовая форма для льда»"
+            )
+            return
 
-    await update.message.reply_text(result)
+        keywords = ask_ai_for_keywords(source_text)
+        if not keywords.get("main") or not contains_chinese(keywords.get("main", "")):
+            keywords = fallback_keywords(source_text)
 
-# =================================
-# ФОТО
-# =================================
+        main_query = keywords.get("main", "").strip()
+        if not main_query:
+            await update.message.reply_text("Не удалось подобрать китайский запрос по фото.")
+            return
 
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        urls = build_search_urls(
+            main_query=main_query,
+            short_query=keywords.get("short", ""),
+            extra_queries=keywords.get("queries", []),
+        )
 
-    await update.message.reply_text("Анализирую фото...")
+        extra = f"Описание фото:\n{image_description}\n\n" if image_description else ""
 
-    caption = update.message.caption
+        text = (
+            f"{extra}{format_keywords_result(keywords)}\n\n"
+            f"{format_supplier_result(urls)}"
+        )
 
-    if caption:
-        query = translate_to_chinese(caption)
-    else:
-        query = "product"
+        await update.message.reply_text(text)
 
-    links = generate_supplier_links(query)
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка обработки фото: {str(e)}")
 
-    await update.message.reply_text(links)
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
 
-# =================================
-# РЕГИСТРАЦИЯ
-# =================================
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    print("Ошибка:", context.error)
+
+
+# =========================================================
+# TELEGRAM APPLICATION
+# =========================================================
+telegram_app: Application = (
+    ApplicationBuilder()
+    .token(TELEGRAM_BOT_TOKEN)
+    .updater(None)
+    .build()
+)
 
 telegram_app.add_handler(CommandHandler("start", start))
-telegram_app.add_handler(CommandHandler("calc", calc))
-telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-telegram_app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+telegram_app.add_handler(CommandHandler("calc", calc_command))
+telegram_app.add_handler(MessageHandler(filters.PHOTO, handle_photo_message))
+telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
+telegram_app.add_error_handler(error_handler)
 
-# =================================
-# WEBHOOK
-# =================================
 
-@api.post("/telegram")
-async def telegram_webhook(req: Request):
+# =========================================================
+# FASTAPI APPLICATION
+# =========================================================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await telegram_app.initialize()
+    await telegram_app.start()
+    await telegram_app.bot.set_webhook(
+        url=f"{PUBLIC_BASE_URL}/telegram",
+        drop_pending_updates=True,
+    )
+    yield
+    await telegram_app.bot.delete_webhook(drop_pending_updates=False)
+    await telegram_app.stop()
+    await telegram_app.shutdown()
 
-    data = await req.json()
 
-    update = Update.de_json(data, telegram_app.bot)
+api = FastAPI(lifespan=lifespan)
 
-    await telegram_app.process_update(update)
-
-    return {"ok": True}
-
-# =================================
-# HEALTH
-# =================================
 
 @api.get("/health")
 async def health():
-    return {"status": "ok"}
+    return PlainTextResponse("ok")
 
-# =================================
-# STARTUP
-# =================================
 
-@api.on_event("startup")
-async def startup():
+@api.get("/")
+async def root():
+    return PlainTextResponse("bot is running")
 
-    await telegram_app.initialize()
-    await telegram_app.start()
 
-    await telegram_app.bot.set_webhook(
-        f"{PUBLIC_BASE_URL}/telegram"
-    )
+@api.post("/telegram")
+async def telegram_webhook(request: Request):
+    data = await request.json()
+    update = Update.de_json(data, telegram_app.bot)
+    await telegram_app.process_update(update)
+    return JSONResponse({"ok": True})
