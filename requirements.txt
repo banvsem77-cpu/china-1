@@ -1,0 +1,2 @@
+python-telegram-bot
+huggingface_hub[inference]
