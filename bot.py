@@ -4,6 +4,9 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 from huggingface_hub import InferenceClient
 
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
 # =========================================================
 # ВСТАВЬТЕ СВОИ КЛЮЧИ
 # =========================================================
@@ -413,12 +416,28 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     print("Ошибка:", context.error)
 
 
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running")
+
+
+def run_http():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), Handler)
+    server.serve_forever()
+
+
 def main():
+    threading.Thread(target=run_http, daemon=True).start()
+
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("calc", calc_command))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo_message))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
     app.add_error_handler(error_handler)
 
     print("Бот запущен...")
