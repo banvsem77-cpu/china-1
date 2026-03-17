@@ -559,7 +559,9 @@ async def root():
 
 @api.post("/telegram")
 async def telegram_webhook(request: Request):
+    logger.warning("telegram webhook hit")
     data = await request.json()
+    logger.warning(f"telegram update: {data}")
     update = Update.de_json(data, telegram_app.bot)
     await telegram_app.process_update(update)
     return JSONResponse({"ok": True})
