@@ -559,26 +559,7 @@ async def root():
 
 @api.post("/telegram")
 async def telegram_webhook(request: Request):
-    print("=== TELEGRAM WEBHOOK HIT ===")
-
     data = await request.json()
-    print("RAW UPDATE:", data)
-
-    try:
-        message = data.get("message", {})
-        print("MESSAGE TEXT:", message.get("text"))
-        print("CHAT ID:", message.get("chat", {}).get("id"))
-    except Exception as e:
-        print("LOG PARSE ERROR:", repr(e))
-
-    try:
-        update = Update.de_json(data, telegram_app.bot)
-        print("UPDATE PARSED")
-
-        await telegram_app.process_update(update)
-        print("UPDATE PROCESSED")
-
-    except Exception as e:
-        print("PROCESS_UPDATE ERROR:", repr(e))
-
+    update = Update.de_json(data, telegram_app.bot)
+    await telegram_app.process_update(update)
     return JSONResponse({"ok": True})
