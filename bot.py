@@ -36,6 +36,8 @@ if not HF_TOKEN:
 if not PUBLIC_BASE_URL:
     raise RuntimeError("Не задан PUBLIC_BASE_URL")
 
+PUBLIC_BASE_URL = PUBLIC_BASE_URL.rstrip("/")
+
 
 # =========================================================
 # AI CLIENTS
@@ -212,7 +214,7 @@ def ask_ai_for_keywords(product_text: str) -> dict:
                     "main": main,
                 }
     except Exception as e:
-        print(f"ask_ai_for_keywords error: {repr(e)}", flush=True)
+        print(f"ask_ai_for_keywords error: {e}", flush=True)
 
     return fallback_keywords(product_text)
 
@@ -225,7 +227,7 @@ def describe_image(image_path: str) -> str:
         )
         return str(result).strip()
     except Exception as e:
-        print(f"describe_image error: {repr(e)}", flush=True)
+        print(f"describe_image error: {e}", flush=True)
         return ""
 
 
@@ -236,8 +238,17 @@ def build_search_urls(main_query: str, short_query: str, extra_queries: list[str
         if q and contains_chinese(q) and q not in ordered:
             ordered.append(q)
 
-    if not ordered:
+    if not ordered and main_query:
         ordered = [main_query]
+
+    if not ordered:
+        return {
+            "1688": [],
+            "Taobao": [],
+            "Alibaba": [],
+            "Tmall": [],
+            "Made-in-China": [],
+        }
 
     while len(ordered) < 7:
         ordered.append(ordered[-1])
@@ -362,7 +373,8 @@ def calculate_total(unit_price: float, total_weight_kg: float, quantity: int):
 # TELEGRAM HANDLERS
 # =========================================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    print("start handler called", flush=True)
+    if not update.message:
+        return
 
     text = (
         "Привет! Я бот закупщика.\n\n"
@@ -381,24 +393,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "силиконовая форма для льда\n"
         "/calc 0.42 18 1000"
     )
-
-    if update.message:
-        await update.message.reply_text(text)
-        print("start reply sent", flush=True)
+    await update.message.reply_text(text)
 
 
 async def calc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    print("calc handler called", flush=True)
-
     if not update.message or not update.message.text:
         return
 
     parsed = parse_calc_text(update.message.text)
 
     if not parsed:
-        await update.message.reply_text(
-            "Неверный формат.\nПример:\n/calc 0.42 18 1000"
-        )
+        await update.message.reply_text("Неверный формат.\nПример:\n/calc 0.42 18 1000")
         return
 
     unit_price, total_weight_kg, quantity = parsed
@@ -417,8 +422,6 @@ async def calc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    print("text handler called", flush=True)
-
     if not update.message or not update.message.text:
         return
 
@@ -442,21 +445,15 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             extra_queries=keywords.get("queries", []),
         )
 
-        text = (
-            f"{format_keywords_result(keywords)}\n\n"
-            f"{format_supplier_result(urls)}"
-        )
-
+        text = f"{format_keywords_result(keywords)}\n\n{format_supplier_result(urls)}"
         await update.message.reply_text(text)
 
     except Exception as e:
-        print(f"handle_text_message error: {repr(e)}", flush=True)
+        print(f"handle_text_message error: {e}", flush=True)
         await update.message.reply_text(f"Ошибка поиска: {str(e)}")
 
 
 async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    print("photo handler called", flush=True)
-
     temp_path = None
 
     try:
@@ -501,16 +498,12 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
         )
 
         extra = f"Описание фото:\n{image_description}\n\n" if image_description else ""
-
-        text = (
-            f"{extra}{format_keywords_result(keywords)}\n\n"
-            f"{format_supplier_result(urls)}"
-        )
+        text = f"{extra}{format_keywords_result(keywords)}\n\n{format_supplier_result(urls)}"
 
         await update.message.reply_text(text)
 
     except Exception as e:
-        print(f"handle_photo_message error: {repr(e)}", flush=True)
+        print(f"handle_photo_message error: {e}", flush=True)
         if update.message:
             await update.message.reply_text(f"Ошибка обработки фото: {str(e)}")
 
@@ -523,7 +516,7 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    print(f"PTB error: {repr(context.error)}", flush=True)
+    print(f"PTB error: {context.error}", flush=True)
 
 
 # =========================================================
@@ -548,48 +541,31 @@ telegram_app.add_error_handler(error_handler)
 # =========================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("lifespan startup begin", flush=True)
+    print("startup begin", flush=True)
 
     await telegram_app.initialize()
-    print("telegram_app.initialize done", flush=True)
-
     await telegram_app.start()
-    print("telegram_app.start done", flush=True)
 
-    webhook_url = f"{PUBLIC_BASE_URL.rstrip('/')}/telegram"
-    print(f"setting webhook: {webhook_url}", flush=True)
-
+    webhook_url = f"{PUBLIC_BASE_URL}/telegram"
     await telegram_app.bot.set_webhook(
         url=webhook_url,
         drop_pending_updates=True,
-        allowed_updates=Update.ALL_TYPES,
+        allowed_updates=["message"],
     )
-    print("webhook set done", flush=True)
 
     info = await telegram_app.bot.get_webhook_info()
     print(f"webhook info: {info}", flush=True)
+    print("startup done", flush=True)
 
     yield
 
-    print("lifespan shutdown begin", flush=True)
-
-    # ВАЖНО:
-    # не удаляем webhook на shutdown, иначе на Render при rolling deploy
-    # старый инстанс может снести webhook у нового инстанса
-
+    print("shutdown begin", flush=True)
     await telegram_app.stop()
-    print("telegram_app.stop done", flush=True)
-
     await telegram_app.shutdown()
-    print("telegram_app.shutdown done", flush=True)
+    print("shutdown done", flush=True)
 
 
 api = FastAPI(lifespan=lifespan)
-
-
-@api.get("/health")
-async def health():
-    return PlainTextResponse("ok")
 
 
 @api.get("/")
@@ -597,22 +573,18 @@ async def root():
     return PlainTextResponse("bot is running")
 
 
+@api.get("/health")
+async def health():
+    return PlainTextResponse("ok")
+
+
 @api.post("/telegram")
 async def telegram_webhook(request: Request):
-    print("telegram webhook hit", flush=True)
-
     try:
         data = await request.json()
-        print(f"telegram update: {data}", flush=True)
-
         update = Update.de_json(data, telegram_app.bot)
-        print("update parsed", flush=True)
-
         await telegram_app.process_update(update)
-        print("update processed", flush=True)
-
         return JSONResponse({"ok": True})
-
     except Exception as e:
-        print(f"telegram webhook error: {repr(e)}", flush=True)
+        print(f"telegram webhook error: {e}", flush=True)
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
