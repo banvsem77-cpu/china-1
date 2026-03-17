@@ -211,8 +211,8 @@ def ask_ai_for_keywords(product_text: str) -> dict:
                     "queries": clean_queries[:5],
                     "main": main,
                 }
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"ask_ai_for_keywords error: {repr(e)}", flush=True)
 
     return fallback_keywords(product_text)
 
@@ -224,18 +224,12 @@ def describe_image(image_path: str) -> str:
             model="Salesforce/blip-image-captioning-base",
         )
         return str(result).strip()
-    except Exception:
+    except Exception as e:
+        print(f"describe_image error: {repr(e)}", flush=True)
         return ""
 
 
 def build_search_urls(main_query: str, short_query: str, extra_queries: list[str]) -> dict:
-    """
-    Делаем стабильные прямые ссылки поиска.
-    1688: 7 ссылок
-    остальные площадки: по 2 ссылки
-    """
-
-    # соберём список уникальных китайских запросов
     ordered = []
     for q in [main_query, short_query] + extra_queries:
         q = (q or "").strip()
@@ -245,7 +239,6 @@ def build_search_urls(main_query: str, short_query: str, extra_queries: list[str
     if not ordered:
         ordered = [main_query]
 
-    # подстрахуемся количеством
     while len(ordered) < 7:
         ordered.append(ordered[-1])
 
@@ -369,6 +362,8 @@ def calculate_total(unit_price: float, total_weight_kg: float, quantity: int):
 # TELEGRAM HANDLERS
 # =========================================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    print("start handler called", flush=True)
+
     text = (
         "Привет! Я бот закупщика.\n\n"
         "Что умею:\n"
@@ -386,10 +381,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "силиконовая форма для льда\n"
         "/calc 0.42 18 1000"
     )
-    await update.message.reply_text(text)
+
+    if update.message:
+        await update.message.reply_text(text)
+        print("start reply sent", flush=True)
 
 
 async def calc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    print("calc handler called", flush=True)
+
+    if not update.message or not update.message.text:
+        return
+
     parsed = parse_calc_text(update.message.text)
 
     if not parsed:
@@ -414,6 +417,11 @@ async def calc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    print("text handler called", flush=True)
+
+    if not update.message or not update.message.text:
+        return
+
     product_name = update.message.text.strip()
 
     try:
@@ -442,13 +450,19 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(text)
 
     except Exception as e:
+        print(f"handle_text_message error: {repr(e)}", flush=True)
         await update.message.reply_text(f"Ошибка поиска: {str(e)}")
 
 
 async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    print("photo handler called", flush=True)
+
     temp_path = None
 
     try:
+        if not update.message or not update.message.photo:
+            return
+
         await update.message.reply_text("Получил фото. Анализирую...")
 
         photo = update.message.photo[-1]
@@ -496,7 +510,9 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(text)
 
     except Exception as e:
-        await update.message.reply_text(f"Ошибка обработки фото: {str(e)}")
+        print(f"handle_photo_message error: {repr(e)}", flush=True)
+        if update.message:
+            await update.message.reply_text(f"Ошибка обработки фото: {str(e)}")
 
     finally:
         if temp_path and os.path.exists(temp_path):
@@ -507,7 +523,7 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    print("Ошибка:", context.error)
+    print(f"PTB error: {repr(context.error)}", flush=True)
 
 
 # =========================================================
@@ -532,16 +548,40 @@ telegram_app.add_error_handler(error_handler)
 # =========================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    print("lifespan startup begin", flush=True)
+
     await telegram_app.initialize()
+    print("telegram_app.initialize done", flush=True)
+
     await telegram_app.start()
+    print("telegram_app.start done", flush=True)
+
+    webhook_url = f"{PUBLIC_BASE_URL.rstrip('/')}/telegram"
+    print(f"setting webhook: {webhook_url}", flush=True)
+
     await telegram_app.bot.set_webhook(
-        url=f"{PUBLIC_BASE_URL}/telegram",
+        url=webhook_url,
         drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES,
     )
+    print("webhook set done", flush=True)
+
+    info = await telegram_app.bot.get_webhook_info()
+    print(f"webhook info: {info}", flush=True)
+
     yield
-    await telegram_app.bot.delete_webhook(drop_pending_updates=False)
+
+    print("lifespan shutdown begin", flush=True)
+
+    # ВАЖНО:
+    # не удаляем webhook на shutdown, иначе на Render при rolling deploy
+    # старый инстанс может снести webhook у нового инстанса
+
     await telegram_app.stop()
+    print("telegram_app.stop done", flush=True)
+
     await telegram_app.shutdown()
+    print("telegram_app.shutdown done", flush=True)
 
 
 api = FastAPI(lifespan=lifespan)
@@ -560,8 +600,19 @@ async def root():
 @api.post("/telegram")
 async def telegram_webhook(request: Request):
     print("telegram webhook hit", flush=True)
-    data = await request.json()
-    print(f"telegram update: {data}", flush=True)
-    update = Update.de_json(data, telegram_app.bot)
-    await telegram_app.process_update(update)
-    return JSONResponse({"ok": True})
+
+    try:
+        data = await request.json()
+        print(f"telegram update: {data}", flush=True)
+
+        update = Update.de_json(data, telegram_app.bot)
+        print("update parsed", flush=True)
+
+        await telegram_app.process_update(update)
+        print("update processed", flush=True)
+
+        return JSONResponse({"ok": True})
+
+    except Exception as e:
+        print(f"telegram webhook error: {repr(e)}", flush=True)
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
